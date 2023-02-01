@@ -1,0 +1,135 @@
+name: k8s worker
+on:
+  repository_dispatch:
+    types:
+      - node/*
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Init env
+        shell: bash
+        run: |
+          K3S_TOKEN=$(cat $GITHUB_EVENT_PATH | jq '.client_payload.meta.cluster.node_token' | sed 's/"//g' | sed 's/\\n/\n/g' )
+          echo "::add-mask::$K3S_TOKEN"
+          echo "K3S_TOKEN=$K3S_TOKEN" >> $GITHUB_ENV
+
+          MASTER_TOKEN=$(cat $GITHUB_EVENT_PATH | jq '.client_payload.meta.master.token' | sed 's/"//g' | sed 's/\\n/\n/g' )
+          echo "::add-mask::$MASTER_TOKEN"
+          echo "MASTER_TOKEN=$MASTER_TOKEN" >> $GITHUB_ENV
+
+          VPN=$(cat $GITHUB_EVENT_PATH | jq '.client_payload.meta.connection.wireguard.iface' | sed 's/"//g' | sed 's/\\n/\n/g' )
+          echo "VPN=$VPN" >> $GITHUB_ENV
+
+          mkdir $HOME/.kube/
+      - name: Install base packages
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install wireguard-tools openresolv openssh-server curl nfs-common -y
+          # init a user
+          sudo useradd -m -g users -G sudo action
+          echo action:action | sudo chpasswd
+          ${{ github.event.client_payload.sysctl_commands }}
+      - name: ZeroTier
+        uses: zerotier/github-action@v1
+        with:
+          network_id: ${{ github.event.client_payload.meta.connection.zerotier.ZEROTIER_NETWORK_ID }}
+          auth_token: ${{ github.event.client_payload.meta.connection.zerotier.ZEROTIER_CENTRAL_TOKEN }}
+      - name: Wireguard
+        shell: bash
+        env:
+          VPN: ${{ env.VPN }}
+        run: |
+          cat $GITHUB_EVENT_PATH | jq '.client_payload.meta.connection.wireguard.data' | sed 's/"//g' | tee -a $VPN > /dev/null
+          base64 -d $VPN > $VPN.conf
+          sudo mv $VPN.conf /etc/wireguard/
+
+          sudo wg-quick up ${{ github.event.client_payload.meta.connection.wireguard.iface }}
+          sudo wg
+          ip route
+      - name: Ping host
+        shell: bash
+        run: |
+          count=5
+          while ! ping -c 1 ${{ github.event.client_payload.meta.cluster.host_ip }} ; do
+            echo "waiting..." ;
+            sleep 1 ;
+            let count=count-1
+          done
+          echo "ping success"
+      - name: Get iface
+        id: iface
+        uses: actions/github-script@v6
+        with:
+          result-encoding: string
+          script: |
+            const connection = context.payload.client_payload.meta.connection;
+            return connection[connection.using].iface;
+      - name: Install K3S
+        shell: bash
+        run: |
+          wget -qO- https://get.k3s.io | sh -s - agent --server ${{ github.event.client_payload.meta.cluster.server }} \
+                                                       --token ${{ env.K3S_TOKEN }} \
+                                                       --node-label "topology.kubernetes.io/zone=github-action" \
+                                                       --flannel-iface ${{ steps.iface.outputs.result }} \
+                                                       --node-name "github-action-"${{ steps.iface.outputs.result }}
+      - name: Sleep
+        shell: bash
+        run: |
+          sleep $(cat $GITHUB_EVENT_PATH | jq -r ".client_payload.meta.worker[] | select(.owner==\"${GITHUB_REPOSITORY%/*}\") | .work_time")
+      - name: Init clusters
+        if: ${{ always() }}
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require("fs");
+            fs.writeFileSync('/home/runner/.kube/config', context.payload.client_payload.meta.cluster.kube_data_config);
+      - name: Quit clusters
+        if: ${{ always() }}
+        shell: bash
+        env:
+          node: "github-action-${{ steps.iface.outputs.result }}"
+        run: |
+          count=5
+          while ! ping -c 1 ${{ github.event.client_payload.meta.cluster.host_ip }} ; do
+            echo "waiting..." ;
+            sleep 1 ;
+            let count=count-1
+          done
+          echo "ping success"
+          kubectl drain $node --force --ignore-daemonsets
+          kubectl delete node $node --force
+      - uses: actions/setup-node@v1
+        if: ${{ always() }}
+        with:
+          version: 18
+      - run: npm install @octokit/action
+        shell: bash
+        if: ${{ always() }}
+      - run: npm install merge-util
+        shell: bash
+        if: ${{ always() }}
+      - name: Quit VPN
+        if: ${{ always() }} && ${{ github.event.client_payload.meta.connection.using }} == 'wireguard'
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ env.MASTER_TOKEN }}
+          vpn: ${{ env.VPN }}
+        with:
+          script: |
+            const { vpn } = process.env;
+            const { Octokit } = require("@octokit/action");
+            const octokit = new Octokit();
+            const merge = require('merge-util');
+
+            const client_payload = merge(context.payload.client_payload, {
+              registe: false,
+            });
+
+            await octokit.request('POST /repos/{owner}/{repo}/dispatches', {
+              owner: 'manager1githubk8s',
+              repo: '.github',
+              event_type: `worker/stop/${vpn}`,
+              client_payload,
+            })
